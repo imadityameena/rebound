@@ -1,0 +1,38 @@
+{
+  "name": "rebound",
+  "version": "1.0.0",
+  "description": "Crashproof workflow Engine",
+  "main": "index.js",
+  "scripts": {
+  "dev": "tsx watch src/server.ts",
+  "build": "tsc",
+  "start": "node dist/server.js",
+  "db:up": "docker compose up -d",
+  "db:down": "docker compose down"
+}
+,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imadityameena/rebound.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/imadityameena/rebound/issues"
+  },
+  "homepage": "https://github.com/imadityameena/rebound#readme",
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
