@@ -36,6 +36,12 @@ const NO_FAULTS: FaultConfig = {
 
 export class FaultRegistry {
   private configs = new Map<FakeServiceName, FaultConfig>();
+  /**
+   * Requests currently waiting out an injected delay. They still do their work
+   * when the delay ends, even if the caller gave up. Tests wait for this to
+   * reach 0 so one test's slow request can't land in the next test.
+   */
+  delayedRequests = 0;
 
   constructor(initial: Partial<Record<FakeServiceName, Partial<FaultConfig>>> = {}) {
     this.reset();
@@ -105,7 +111,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 export function injectNetworkFaults(registry: FaultRegistry, service: FakeServiceName) {
   return async (_req: Request, _res: Response, next: NextFunction) => {
     const faults = registry.get(service);
-    if (faults.latencyMs > 0) await sleep(faults.latencyMs);
+    if (faults.latencyMs > 0) {
+      registry.delayedRequests++;
+      await sleep(faults.latencyMs);
+      registry.delayedRequests--;
+    }
     if (Math.random() < faults.hangRate) return; // never call next(), never reply
     next();
   };
