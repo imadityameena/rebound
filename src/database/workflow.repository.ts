@@ -1,8 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { pool } from "./pool";
-import type { StepRow, WorkflowRow } from "../types/workflow";
+import type { StepRow, WorkflowRow, WorkflowStatus } from "../types/workflow";
 
 /** All SQL for workflows and steps lives here, so the engine reads like the state machine it is. */
+
+/**
+ * Thrown when a worker tries to write to a workflow it no longer holds the
+ * lease on, for example after a long pause let the lease expire and another
+ * worker took over. The write is rejected, so two workers can never both
+ * record results for the same workflow.
+ */
+export class LeaseLostError extends Error {
+  constructor(workflowId: string, workerId: string) {
+    super(`Worker ${workerId} no longer holds the lease on workflow ${workflowId}`);
+    this.name = "LeaseLostError";
+  }
+}
+
+// Appended to step/workflow updates: "...only if this worker still holds the lease".
+const HOLDS_LEASE = `EXISTS (SELECT 1 FROM workflows w WHERE w.id = $1 AND w.locked_by = $2)`;
 
 export async function createWorkflow(type: string, input: unknown, stepNames: string[]): Promise<WorkflowRow> {
   const client = await pool.connect();
@@ -43,35 +59,130 @@ export async function getSteps(workflowId: string): Promise<StepRow[]> {
   return rows;
 }
 
-export async function setWorkflowStatus(id: string, status: WorkflowRow["status"], error: string | null = null) {
-  await pool.query(`UPDATE workflows SET status = $2, error = $3, updated_at = now() WHERE id = $1`, [id, status, error]);
+// ---------- Leases ----------
+
+/**
+ * Atomically picks one runnable workflow and takes the lease on it.
+ * Runnable = unfinished, due, and not leased by a live worker.
+ * FOR UPDATE SKIP LOCKED lets many workers run this at once without ever
+ * picking the same row.
+ */
+export async function claimNextWorkflow(workerId: string, leaseMs: number): Promise<WorkflowRow | undefined> {
+  const { rows } = await pool.query<WorkflowRow>(
+    `UPDATE workflows
+        SET status = 'running',
+            locked_by = $1,
+            lease_expires_at = now() + make_interval(secs => $2 / 1000.0),
+            updated_at = now()
+      WHERE id = (
+        SELECT id FROM workflows
+         WHERE status IN ('pending', 'running')
+           AND next_run_at <= now()
+           AND (lease_expires_at IS NULL OR lease_expires_at < now())
+         ORDER BY next_run_at, created_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1
+      )
+      RETURNING *`,
+    [workerId, leaseMs],
+  );
+  return rows[0];
+}
+
+/** Extends the lease. Returns false if this worker has lost it. */
+export async function renewLease(workflowId: string, workerId: string, leaseMs: number): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE workflows
+        SET lease_expires_at = now() + make_interval(secs => $3 / 1000.0)
+      WHERE id = $1 AND locked_by = $2`,
+    [workflowId, workerId, leaseMs],
+  );
+  return rowCount === 1;
+}
+
+/**
+ * Releases every lease this worker ID holds. Only safe at startup: if a worker
+ * with our ID held leases, it was a previous run of this same process, which
+ * is now dead.
+ */
+export async function releaseLeasesHeldBy(workerId: string): Promise<WorkflowRow[]> {
+  const { rows } = await pool.query<WorkflowRow>(
+    `UPDATE workflows SET locked_by = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE locked_by = $1 AND status IN ('pending', 'running')
+      RETURNING *`,
+    [workerId],
+  );
+  return rows;
+}
+
+export async function listUnfinished(): Promise<(WorkflowRow & { current_step: string | null })[]> {
+  const { rows } = await pool.query(
+    `SELECT w.*,
+            (SELECT s.name || ' (' || s.status || ')' FROM workflow_steps s
+              WHERE s.workflow_id = w.id AND s.status <> 'succeeded'
+              ORDER BY s.step_index LIMIT 1) AS current_step
+       FROM workflows w
+      WHERE w.status IN ('pending', 'running')
+      ORDER BY w.created_at`,
+  );
+  return rows;
+}
+
+// ---------- Writes made while holding the lease ----------
+
+async function fencedUpdate(sql: string, params: unknown[], workflowId: string, workerId: string) {
+  const { rowCount } = await pool.query(sql, params);
+  if (rowCount === 0) throw new LeaseLostError(workflowId, workerId);
+}
+
+/** Sets a final status and gives up the lease. */
+export async function finishWorkflow(
+  workflowId: string,
+  workerId: string,
+  status: Extract<WorkflowStatus, "completed" | "failed">,
+  error: string | null = null,
+) {
+  await fencedUpdate(
+    `UPDATE workflows
+        SET status = $3, error = $4, locked_by = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE id = $1 AND locked_by = $2`,
+    [workflowId, workerId, status, error],
+    workflowId,
+    workerId,
+  );
 }
 
 /** Written BEFORE the external call. */
-export async function markStepRunning(workflowId: string, stepIndex: number) {
-  await pool.query(
+export async function markStepRunning(workflowId: string, workerId: string, stepIndex: number) {
+  await fencedUpdate(
     `UPDATE workflow_steps
         SET status = 'running', attempts = attempts + 1, started_at = now(), error = NULL
-      WHERE workflow_id = $1 AND step_index = $2`,
-    [workflowId, stepIndex],
+      WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
+    [workflowId, workerId, stepIndex],
+    workflowId,
+    workerId,
   );
 }
 
 /** Written AFTER the external call returned successfully. */
-export async function markStepSucceeded(workflowId: string, stepIndex: number, output: unknown) {
-  await pool.query(
+export async function markStepSucceeded(workflowId: string, workerId: string, stepIndex: number, output: unknown) {
+  await fencedUpdate(
     `UPDATE workflow_steps
-        SET status = 'succeeded', output = $3, completed_at = now()
-      WHERE workflow_id = $1 AND step_index = $2`,
-    [workflowId, stepIndex, JSON.stringify(output)],
+        SET status = 'succeeded', output = $4, completed_at = now()
+      WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
+    [workflowId, workerId, stepIndex, JSON.stringify(output)],
+    workflowId,
+    workerId,
   );
 }
 
-export async function markStepFailed(workflowId: string, stepIndex: number, error: string) {
-  await pool.query(
+export async function markStepFailed(workflowId: string, workerId: string, stepIndex: number, error: string) {
+  await fencedUpdate(
     `UPDATE workflow_steps
-        SET status = 'failed', error = $3, completed_at = now()
-      WHERE workflow_id = $1 AND step_index = $2`,
-    [workflowId, stepIndex, error],
+        SET status = 'failed', error = $4, completed_at = now()
+      WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
+    [workflowId, workerId, stepIndex, error],
+    workflowId,
+    workerId,
   );
 }

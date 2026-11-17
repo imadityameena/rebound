@@ -46,4 +46,21 @@ export const migrations: Migration[] = [
       CREATE INDEX workflows_status_idx ON workflows (status);
     `,
   },
+  {
+    id: "002_worker_leases",
+    sql: `
+      -- Which worker is running this workflow, and until when its claim holds.
+      -- A worker keeps extending lease_expires_at while it works. If it dies,
+      -- the lease runs out and another worker may take over.
+      ALTER TABLE workflows
+        ADD COLUMN locked_by        text,
+        ADD COLUMN lease_expires_at timestamptz,
+        -- Earliest time a worker may pick this workflow up (used for retries in Step 7).
+        ADD COLUMN next_run_at      timestamptz NOT NULL DEFAULT now();
+
+      -- Makes "find the next runnable workflow" cheap, even with many finished rows.
+      CREATE INDEX workflows_runnable_idx ON workflows (next_run_at)
+        WHERE status IN ('pending', 'running');
+    `,
+  },
 ];

@@ -1,28 +1,31 @@
-import express from "express";
 import { config } from "./config/env";
-import { healthRouter } from "./routes/health.routes";
-import { ordersRouter } from "./routes/orders.routes";
-import { errorHandler } from "./middleware/error-handler";
+import { createApp } from "./app";
 import { pool } from "./database/pool";
 import { migrate } from "./database/migrate";
+import { recoverOnStartup } from "./workflow/recovery";
+import { Worker } from "./workflow/worker";
 
 async function main() {
   const applied = await migrate(pool);
   if (applied.length) console.log(`Applied migrations: ${applied.join(", ")}`);
 
-  const app = express();
-  app.use(express.json());
-  app.use(healthRouter);
-  app.use(ordersRouter);
-  app.use(errorHandler);
+  // Recover before accepting new work, so unfinished workflows are first in line.
+  await recoverOnStartup(config.worker.id);
+  const worker = new Worker(config.worker);
+  worker.start();
+  console.log(`Worker ${worker.id} started (concurrency ${config.worker.concurrency})`);
 
-  const server = app.listen(config.port, () => {
+  const server = createApp().listen(config.port, () => {
     console.log(`API listening on http://localhost:${config.port}`);
   });
 
+  let stopping = false;
   async function shutdown(signal: string) {
-    console.log(`${signal} received, shutting down`);
+    if (stopping) return;
+    stopping = true;
+    console.log(`${signal} received: finishing in-flight workflows, then exiting`);
     server.close();
+    await worker.stop();
     await pool.end();
     process.exit(0);
   }

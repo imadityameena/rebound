@@ -1,6 +1,5 @@
 import type { WorkflowDefinition } from "../types/workflow";
 import * as repo from "../database/workflow.repository";
-import { executeWorkflow } from "./executor";
 import { orderWorkflow } from "./order-workflow";
 
 /** Every workflow type the engine knows how to run, looked up by the `type` column. */
@@ -12,15 +11,12 @@ export function getDefinition(type: string): WorkflowDefinition<unknown> {
   return definition;
 }
 
-/** Saves a new workflow and all its steps as 'pending'. Nothing external happens yet. */
+/**
+ * Saves a new workflow and all its steps as 'pending'. Nothing external happens
+ * here: a worker picks it up from the database and runs it.
+ */
 export async function createWorkflow<TInput>(definition: WorkflowDefinition<TInput>, input: TInput) {
   return repo.createWorkflow(definition.type, input, definition.steps.map((s) => s.name));
-}
-
-export async function runWorkflow(workflowId: string) {
-  const workflow = await repo.getWorkflow(workflowId);
-  if (!workflow) throw new Error(`Workflow ${workflowId} not found`);
-  await executeWorkflow(getDefinition(workflow.type), workflowId);
 }
 
 /** Workflow + steps, shaped for API responses. */
