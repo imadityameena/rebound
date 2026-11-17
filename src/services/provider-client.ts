@@ -18,13 +18,20 @@ export class ServiceError extends Error {
   }
 }
 
-/** POSTs JSON to the provider and turns every failure into a ServiceError. */
-export async function postJson<T>(path: string, body: unknown): Promise<T> {
+/**
+ * POSTs JSON to the provider and turns every failure into a ServiceError.
+ * With an idempotency key, repeating the call is safe: the provider returns
+ * the saved result instead of doing the work again.
+ */
+export async function postJson<T>(path: string, body: unknown, idempotencyKey?: string): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${config.fakesUrl}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+      },
       body: JSON.stringify(body),
     });
   } catch (err) {

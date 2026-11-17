@@ -11,7 +11,8 @@ export const log = (workflowId: string, msg: string) => console.log(`[wf ${workf
  *
  * Steps that already succeeded are skipped, and their saved outputs are loaded
  * back into the context. A step left 'running' by a crash is executed again:
- * we cannot know whether the earlier call took effect. Step 6 makes that safe.
+ * we cannot know whether the earlier call took effect, so the step is
+ * repeated with the same idempotency key and the provider replays the result.
  */
 export async function executeWorkflow<TInput>(
   definition: WorkflowDefinition<TInput>,
@@ -19,7 +20,7 @@ export async function executeWorkflow<TInput>(
   workerId: string,
 ) {
   const id = workflow.id;
-  const ctx: StepContext<TInput> = { workflowId: id, input: workflow.input as TInput, results: {} };
+  const ctx: StepContext<TInput> = { workflowId: id, input: workflow.input as TInput, results: {}, idempotencyKey: "" };
   const steps = await repo.getSteps(id);
 
   for (const [index, step] of definition.steps.entries()) {
@@ -29,8 +30,9 @@ export async function executeWorkflow<TInput>(
       continue;
     }
 
+    ctx.idempotencyKey = `${id}:${step.name}`;
     if (saved.status === "running") {
-      log(id, `${step.name}: was in progress when the previous run stopped; outcome unknown, running it again`);
+      log(id, `${step.name}: was in progress when the previous run stopped; outcome unknown, repeating it with the same idempotency key`);
     }
     await repo.markStepRunning(id, workerId, index);
     log(id, `${step.name}: started (attempt ${saved.attempts + 1})`);

@@ -10,19 +10,21 @@ export const orderWorkflow: WorkflowDefinition<OrderInput> = {
   steps: [
     {
       name: "reserve_inventory",
-      execute: async ({ input }) => reserveStock(input.sku, input.quantity),
+      execute: async ({ input, idempotencyKey }) => reserveStock(input.sku, input.quantity, idempotencyKey),
     },
     {
       name: "charge_payment",
-      execute: async ({ input }) => chargePayment(input.amountCents, input.customerEmail),
+      execute: async ({ input, idempotencyKey }) =>
+        chargePayment(input.amountCents, input.customerEmail, idempotencyKey),
     },
     {
       name: "confirm_order",
-      execute: async ({ workflowId, input }) =>
+      execute: async ({ workflowId, input, idempotencyKey }) =>
         sendEmail(
           input.customerEmail,
           "Your order is confirmed",
           `Order ${workflowId}: ${input.quantity} x ${input.sku}.`,
+          idempotencyKey,
         ),
     },
   ],

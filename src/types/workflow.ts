@@ -29,6 +29,12 @@ export interface StepRow {
 /** What a step can see: the workflow input and the outputs of earlier steps. */
 export interface StepContext<TInput> {
   workflowId: string;
+  /**
+   * Stable for this workflow + step: "<workflowId>:<stepName>". Sent to the
+   * provider so that re-running the step (after a crash or a retry) replays
+   * the first result instead of repeating the side effect.
+   */
+  idempotencyKey: string;
   input: TInput;
   results: Record<string, Record<string, unknown>>;
 }
