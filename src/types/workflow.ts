@@ -1,5 +1,7 @@
+import type { RetryPolicy } from "../workflow/retry";
+
 export type WorkflowStatus = "pending" | "running" | "completed" | "failed";
-export type StepStatus = "pending" | "running" | "succeeded" | "failed";
+export type StepStatus = "pending" | "running" | "retry_scheduled" | "succeeded" | "failed";
 
 export interface WorkflowRow {
   id: string;
@@ -37,12 +39,16 @@ export interface StepContext<TInput> {
    * the first result instead of repeating the side effect.
    */
   idempotencyKey: string;
+  /** Per-call timeout for this step. */
+  timeoutMs: number;
   input: TInput;
   results: Record<string, Record<string, unknown>>;
 }
 
 export interface StepDefinition<TInput> {
   name: string;
+  /** Overrides the default retry policy for this step. */
+  retry?: Partial<RetryPolicy>;
   execute: (ctx: StepContext<TInput>) => Promise<Record<string, unknown>>;
 }
 

@@ -18,29 +18,45 @@ export class ServiceError extends Error {
   }
 }
 
-/**
- * POSTs JSON to the provider and turns every failure into a ServiceError.
- * With an idempotency key, repeating the call is safe: the provider returns
- * the saved result instead of doing the work again.
- */
-export async function postJson<T>(path: string, body: unknown, idempotencyKey?: string): Promise<T> {
+export interface CallOptions {
+  /** Makes repeating the call safe: the provider replays the first result. */
+  idempotencyKey?: string;
+  /** Abort the call if no response arrives in time. */
+  timeoutMs?: number;
+}
+
+/** POSTs JSON to the provider and turns every failure into a ServiceError. */
+export async function postJson<T>(path: string, body: unknown, opts: CallOptions = {}): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${config.fakesUrl}${path}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+        ...(opts.idempotencyKey ? { "idempotency-key": opts.idempotencyKey } : {}),
       },
       body: JSON.stringify(body),
+      signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
     });
   } catch (err) {
+    if ((err as Error).name === "TimeoutError") {
+      // A timeout does NOT mean the operation failed. The provider may have
+      // done the work and just been slow to reply. Treat the outcome as
+      // unknown: retry with the same idempotency key and let the provider
+      // tell us what happened.
+      throw new ServiceError(`${path}: no response within ${opts.timeoutMs}ms (outcome unknown)`, "transient");
+    }
     // The request never got a reply: refused, reset, or dropped mid-way.
     throw new ServiceError(`${path}: network error (${(err as Error).message})`, "transient");
   }
 
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  let data: { error?: string } = {};
+  try {
+    const text = await res.text();
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new ServiceError(`${path}: unreadable response (HTTP ${res.status})`, "transient", res.status);
+  }
   if (res.ok) return data as T;
 
   const kind: FailureKind = res.status >= 500 ? "transient" : "permanent";

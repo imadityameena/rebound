@@ -1,13 +1,13 @@
-import { postJson } from "./provider-client";
+import { postJson, type CallOptions } from "./provider-client";
 
 export async function chargePayment(
   amountCents: number,
   customerEmail: string,
-  idempotencyKey: string,
+  opts: CallOptions,
 ): Promise<{ chargeId: string }> {
-  return postJson("/payments/charges", { amountCents, customerEmail }, idempotencyKey);
+  return postJson("/payments/charges", { amountCents, customerEmail }, opts);
 }
 
-export async function refundPayment(chargeId: string, idempotencyKey: string): Promise<void> {
-  await postJson(`/payments/charges/${chargeId}/refund`, {}, idempotencyKey);
+export async function refundPayment(chargeId: string, opts: CallOptions): Promise<void> {
+  await postJson(`/payments/charges/${chargeId}/refund`, {}, opts);
 }

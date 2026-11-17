@@ -18,6 +18,13 @@ export const config = {
     pollMs: Number(process.env.WORKER_POLL_MS ?? 250),
     concurrency: Number(process.env.WORKER_CONCURRENCY ?? 4),
   },
+  /** Defaults for every step; a step definition can override any of them. */
+  retry: {
+    maxAttempts: Number(process.env.RETRY_MAX_ATTEMPTS ?? 5),
+    baseDelayMs: Number(process.env.RETRY_BASE_DELAY_MS ?? 200),
+    maxDelayMs: Number(process.env.RETRY_MAX_DELAY_MS ?? 10_000),
+    timeoutMs: Number(process.env.STEP_TIMEOUT_MS ?? 3_000),
+  },
   db: {
     host: required("DB_HOST"),
     port: Number(required("DB_PORT")),

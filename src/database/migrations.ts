@@ -79,4 +79,14 @@ export const migrations: Migration[] = [
         WHERE idempotency_key IS NOT NULL;
     `,
   },
+  {
+    id: "004_retry_scheduled",
+    sql: `
+      -- A step that failed transiently and is waiting for its next attempt.
+      -- The wait itself is workflows.next_run_at, so it survives a crash.
+      ALTER TABLE workflow_steps DROP CONSTRAINT workflow_steps_status_check;
+      ALTER TABLE workflow_steps ADD CONSTRAINT workflow_steps_status_check
+        CHECK (status IN ('pending', 'running', 'retry_scheduled', 'succeeded', 'failed'));
+    `,
+  },
 ];

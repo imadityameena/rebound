@@ -204,6 +204,35 @@ export async function markStepSucceeded(workflowId: string, workerId: string, st
   );
 }
 
+/** A transient failure: record it and leave the step waiting for its next attempt. */
+export async function markStepRetryScheduled(workflowId: string, workerId: string, stepIndex: number, error: string) {
+  await fencedUpdate(
+    `UPDATE workflow_steps
+        SET status = 'retry_scheduled', error = $4
+      WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
+    [workflowId, workerId, stepIndex, error],
+    workflowId,
+    workerId,
+  );
+}
+
+/**
+ * Gives up the lease and makes the workflow due again after `delayMs`.
+ * The wait lives in the database, not in a sleeping process, so a crash
+ * during the wait loses nothing and the worker slot is free meanwhile.
+ */
+export async function rescheduleWorkflow(workflowId: string, workerId: string, delayMs: number) {
+  await fencedUpdate(
+    `UPDATE workflows
+        SET next_run_at = now() + make_interval(secs => $3 / 1000.0),
+            locked_by = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE id = $1 AND locked_by = $2`,
+    [workflowId, workerId, delayMs],
+    workflowId,
+    workerId,
+  );
+}
+
 export async function markStepFailed(workflowId: string, workerId: string, stepIndex: number, error: string) {
   await fencedUpdate(
     `UPDATE workflow_steps
