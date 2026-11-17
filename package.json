@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
     "db:up": "docker compose up -d --wait",
-    "db:down": "docker compose down"
+    "db:down": "docker compose down",
+    "db:migrate": "tsx src/database/migrate.ts",
+    "db:psql": "docker compose exec postgres sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"'"
   },
   "repository": {
     "type": "git",
