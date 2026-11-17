@@ -1,16 +1,18 @@
 {
   "name": "rebound",
   "version": "1.0.0",
-  "description": "Crashproof workflow Engine",
-  "main": "index.js",
+  "description": "A crash-proof order workflow engine: persisted state, crash recovery, idempotency, retries and saga compensation.",
+  "main": "dist/server.js",
   "scripts": {
-  "dev": "tsx watch src/server.ts",
-  "build": "tsc",
-  "start": "node dist/server.js",
-  "db:up": "docker compose up -d",
-  "db:down": "docker compose down"
-}
-,
+    "dev": "tsx watch src/server.ts",
+    "start:api": "tsx src/server.ts",
+    "fakes": "tsx src/fakes/server.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/imadityameena/rebound.git"
