@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { WorkflowDefinition } from "../types/workflow";
 import * as repo from "../database/workflow.repository";
 import { orderWorkflow } from "./order-workflow";
@@ -11,12 +12,37 @@ export function getDefinition(type: string): WorkflowDefinition<unknown> {
   return definition;
 }
 
+export class IdempotencyConflictError extends Error {
+  constructor(readonly existingWorkflowId: string) {
+    super("This Idempotency-Key was already used with a different request body");
+    this.name = "IdempotencyConflictError";
+  }
+}
+
 /**
  * Saves a new workflow and all its steps as 'pending'. Nothing external happens
  * here: a worker picks it up from the database and runs it.
+ *
+ * With an idempotency key, a repeated request returns the original workflow
+ * (`created: false`) instead of starting a second one.
  */
-export async function createWorkflow<TInput>(definition: WorkflowDefinition<TInput>, input: TInput) {
-  return repo.createWorkflow(definition.type, input, definition.steps.map((s) => s.name));
+export async function createWorkflow<TInput>(
+  definition: WorkflowDefinition<TInput>,
+  input: TInput,
+  idempotencyKey?: string,
+) {
+  const requestHash = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  const result = await repo.createWorkflow({
+    type: definition.type,
+    input,
+    stepNames: definition.steps.map((s) => s.name),
+    idempotencyKey,
+    requestHash,
+  });
+  if (!result.created && result.workflow.request_hash !== requestHash) {
+    throw new IdempotencyConflictError(result.workflow.id);
+  }
+  return result;
 }
 
 /** Workflow + steps, shaped for API responses. */

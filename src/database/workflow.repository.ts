@@ -20,15 +20,43 @@ export class LeaseLostError extends Error {
 // Appended to step/workflow updates: "...only if this worker still holds the lease".
 const HOLDS_LEASE = `EXISTS (SELECT 1 FROM workflows w WHERE w.id = $1 AND w.locked_by = $2)`;
 
-export async function createWorkflow(type: string, input: unknown, stepNames: string[]): Promise<WorkflowRow> {
+export interface CreateWorkflowParams {
+  type: string;
+  input: unknown;
+  stepNames: string[];
+  idempotencyKey?: string;
+  requestHash?: string;
+}
+
+/**
+ * Inserts a workflow and its steps, or returns the existing workflow if one
+ * with the same (type, idempotency key) already exists.
+ */
+export async function createWorkflow(params: CreateWorkflowParams): Promise<{ workflow: WorkflowRow; created: boolean }> {
+  const { type, input, stepNames, idempotencyKey = null, requestHash = null } = params;
   const client = await pool.connect();
   try {
     // One transaction: never a workflow without its steps, or steps without a workflow.
     await client.query("BEGIN");
     const { rows } = await client.query<WorkflowRow>(
-      `INSERT INTO workflows (id, type, status, input) VALUES ($1, $2, 'pending', $3) RETURNING *`,
-      [randomUUID(), type, JSON.stringify(input)],
+      `INSERT INTO workflows (id, type, status, input, idempotency_key, request_hash)
+       VALUES ($1, $2, 'pending', $3, $4, $5)
+       ON CONFLICT (type, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+       RETURNING *`,
+      [randomUUID(), type, JSON.stringify(input), idempotencyKey, requestHash],
     );
+
+    if (rows.length === 0) {
+      // Same key seen before. If the first insert was still in flight, Postgres
+      // waited for it to commit, so this SELECT sees it.
+      await client.query("ROLLBACK");
+      const existing = await pool.query<WorkflowRow>(
+        `SELECT * FROM workflows WHERE type = $1 AND idempotency_key = $2`,
+        [type, idempotencyKey],
+      );
+      return { workflow: existing.rows[0], created: false };
+    }
+
     const workflow = rows[0];
     for (const [index, name] of stepNames.entries()) {
       await client.query(
@@ -37,7 +65,7 @@ export async function createWorkflow(type: string, input: unknown, stepNames: st
       );
     }
     await client.query("COMMIT");
-    return workflow;
+    return { workflow, created: true };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

@@ -7,6 +7,8 @@ export interface WorkflowRow {
   status: WorkflowStatus;
   input: unknown;
   error: string | null;
+  idempotency_key: string | null;
+  request_hash: string | null;
   locked_by: string | null;
   lease_expires_at: Date | null;
   next_run_at: Date;

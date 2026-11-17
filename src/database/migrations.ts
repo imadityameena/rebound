@@ -63,4 +63,20 @@ export const migrations: Migration[] = [
         WHERE status IN ('pending', 'running');
     `,
   },
+  {
+    id: "003_request_idempotency",
+    sql: `
+      -- The client's Idempotency-Key for POST /orders, plus a hash of the request
+      -- body, so a retry with the same key returns the same order instead of
+      -- creating a second one, and a reused key with a different body is caught.
+      ALTER TABLE workflows
+        ADD COLUMN idempotency_key text,
+        ADD COLUMN request_hash    text;
+
+      -- The database, not application code, guarantees one workflow per key,
+      -- even when two identical requests arrive at the same moment.
+      CREATE UNIQUE INDEX workflows_idempotency_key_idx ON workflows (type, idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+    `,
+  },
 ];
