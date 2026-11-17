@@ -99,38 +99,47 @@ export function faultsFromEnv(env: NodeJS.ProcessEnv): Partial<Record<FakeServic
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Express middleware that applies the configured faults before the real handler runs.
- * "dropResponseRate" is handled after the handler by `maybeDropResponse`.
+ * Network-level faults: applied before the request reaches the service, like a
+ * slow or broken network. A hung request never gets processed at all.
  */
-export function injectFaults(registry: FaultRegistry, service: FakeServiceName) {
-  return async (_req: Request, res: Response, next: NextFunction) => {
+export function injectNetworkFaults(registry: FaultRegistry, service: FakeServiceName) {
+  return async (_req: Request, _res: Response, next: NextFunction) => {
     const faults = registry.get(service);
-
     if (faults.latencyMs > 0) await sleep(faults.latencyMs);
+    if (Math.random() < faults.hangRate) return; // never call next(), never reply
+    next();
+  };
+}
 
-    if (Math.random() < faults.hangRate) {
-      // Never call next() or send anything: the request just hangs.
-      return;
-    }
+/**
+ * Service-level faults: the service received the request and refused it.
+ * Applied after the idempotency check, the way a real provider would.
+ */
+export function injectServiceFaults(registry: FaultRegistry, service: FakeServiceName) {
+  return (_req: Request, res: Response, next: NextFunction) => {
+    const faults = registry.get(service);
 
     if (faults.failNext > 0) {
       registry.update(service, { failNext: faults.failNext - 1 });
-      res.status(503).json({ error: "service_unavailable", detail: "injected (failNext)" });
-      return;
+      return send(res, 503, { error: "service_unavailable", detail: "injected (failNext)" });
     }
-
     if (Math.random() < faults.failureRate) {
-      res.status(503).json({ error: "service_unavailable", detail: "injected transient failure" });
-      return;
+      return send(res, 503, { error: "service_unavailable", detail: "injected transient failure" });
     }
-
     if (Math.random() < faults.rejectRate) {
-      res.status(422).json({ error: "rejected", detail: "injected permanent failure" });
-      return;
+      return send(res, 422, { error: "rejected", detail: "injected permanent failure" });
     }
-
     next();
   };
+}
+
+/**
+ * Sends a response, first recording it for idempotent replay (if the request
+ * had a key). Recording comes first, so even a dropped response is remembered.
+ */
+export function send(res: Response, status: number, body: unknown) {
+  (res.locals.recordIdempotentResult as ((s: number, b: unknown) => void) | undefined)?.(status, body);
+  res.status(status).json(body);
 }
 
 /**

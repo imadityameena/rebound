@@ -3,10 +3,13 @@ import { randomUUID } from "node:crypto";
 import {
   FaultRegistry,
   FAKE_SERVICES,
-  injectFaults,
+  injectNetworkFaults,
+  injectServiceFaults,
   maybeDropResponse,
+  send,
   type FakeServiceName,
 } from "./faults";
+import { IdempotencyStore } from "./idempotency";
 
 /**
  * A stand-in for three external companies: an inventory system, a payment
@@ -45,6 +48,7 @@ export class FakeProviderState {
   reservations = new Map<string, Reservation>();
   charges = new Map<string, Charge>();
   emails: Email[] = [];
+  idempotency = new IdempotencyStore();
 
   constructor() {
     this.reset();
@@ -55,6 +59,7 @@ export class FakeProviderState {
     this.reservations.clear();
     this.charges.clear();
     this.emails = [];
+    this.idempotency.clear();
   }
 
   snapshot() {
@@ -69,6 +74,7 @@ export class FakeProviderState {
         capturedCents: charges.filter((c) => c.status === "captured").reduce((s, c) => s + c.amountCents, 0),
         refunds: charges.filter((c) => c.status === "refunded").length,
         emails: this.emails.length,
+        idempotencyKeys: this.idempotency.size(),
       },
       reservations,
       charges,
@@ -81,73 +87,78 @@ export function createFakeProviderApp(faults = new FaultRegistry(), state = new 
   const app = express();
   app.use(express.json());
 
+  // Request pipeline for every service endpoint:
+  //   network faults (latency, hang) → idempotency replay → service faults (503/422) → handler
+  const guard = (service: FakeServiceName) => [
+    injectNetworkFaults(faults, service),
+    state.idempotency.middleware(),
+    injectServiceFaults(faults, service),
+  ];
+
+  /** Records the result, possibly drops the connection (the work is already done), then replies. */
+  const reply = (service: FakeServiceName, res: Response, status: number, body: unknown) => {
+    (res.locals.recordIdempotentResult as ((s: number, b: unknown) => void) | undefined)?.(status, body);
+    if (maybeDropResponse(faults, service, res)) return;
+    res.status(status).json(body);
+  };
+
   // ---------- Inventory ----------
-  app.post("/inventory/reservations", injectFaults(faults, "inventory"), (req: Request, res: Response) => {
+  app.post("/inventory/reservations", ...guard("inventory"), (req: Request, res: Response) => {
     const { sku, quantity } = req.body ?? {};
     if (typeof sku !== "string" || !Number.isInteger(quantity) || quantity <= 0) {
-      return res.status(400).json({ error: "invalid_request" });
+      return send(res, 400, { error: "invalid_request" });
     }
     const available = state.stock.get(sku);
-    if (available === undefined) return res.status(404).json({ error: "unknown_sku" });
-    if (available < quantity) return res.status(409).json({ error: "out_of_stock", available });
+    if (available === undefined) return send(res, 404, { error: "unknown_sku" });
+    if (available < quantity) return send(res, 409, { error: "out_of_stock", available });
 
     state.stock.set(sku, available - quantity);
     const reservation: Reservation = { id: randomUUID(), sku, quantity, status: "reserved" };
     state.reservations.set(reservation.id, reservation);
-
-    if (maybeDropResponse(faults, "inventory", res)) return;
-    res.status(201).json({ reservationId: reservation.id });
+    reply("inventory", res, 201, { reservationId: reservation.id });
   });
 
-  app.post("/inventory/reservations/:id/release", injectFaults(faults, "inventory"), (req: Request, res: Response) => {
+  app.post("/inventory/reservations/:id/release", ...guard("inventory"), (req: Request, res: Response) => {
     const reservation = state.reservations.get(String(req.params.id));
-    if (!reservation) return res.status(404).json({ error: "unknown_reservation" });
+    if (!reservation) return send(res, 404, { error: "unknown_reservation" });
 
     // Releasing twice must not put the stock back twice.
     if (reservation.status === "reserved") {
       reservation.status = "released";
       state.stock.set(reservation.sku, (state.stock.get(reservation.sku) ?? 0) + reservation.quantity);
     }
-
-    if (maybeDropResponse(faults, "inventory", res)) return;
-    res.json({ reservationId: reservation.id, status: reservation.status });
+    reply("inventory", res, 200, { reservationId: reservation.id, status: reservation.status });
   });
 
   // ---------- Payment ----------
-  app.post("/payments/charges", injectFaults(faults, "payment"), (req: Request, res: Response) => {
+  app.post("/payments/charges", ...guard("payment"), (req: Request, res: Response) => {
     const { amountCents, customerEmail } = req.body ?? {};
     if (!Number.isInteger(amountCents) || amountCents <= 0 || typeof customerEmail !== "string") {
-      return res.status(400).json({ error: "invalid_request" });
+      return send(res, 400, { error: "invalid_request" });
     }
     const charge: Charge = { id: randomUUID(), amountCents, customerEmail, status: "captured" };
     state.charges.set(charge.id, charge);
-
-    if (maybeDropResponse(faults, "payment", res)) return;
-    res.status(201).json({ chargeId: charge.id });
+    reply("payment", res, 201, { chargeId: charge.id });
   });
 
-  app.post("/payments/charges/:id/refund", injectFaults(faults, "payment"), (req: Request, res: Response) => {
+  app.post("/payments/charges/:id/refund", ...guard("payment"), (req: Request, res: Response) => {
     const charge = state.charges.get(String(req.params.id));
-    if (!charge) return res.status(404).json({ error: "unknown_charge" });
+    if (!charge) return send(res, 404, { error: "unknown_charge" });
 
     // Refunding twice must not pay the customer back twice.
     charge.status = "refunded";
-
-    if (maybeDropResponse(faults, "payment", res)) return;
-    res.json({ chargeId: charge.id, status: charge.status });
+    reply("payment", res, 200, { chargeId: charge.id, status: charge.status });
   });
 
   // ---------- Email ----------
-  app.post("/emails", injectFaults(faults, "email"), (req: Request, res: Response) => {
+  app.post("/emails", ...guard("email"), (req: Request, res: Response) => {
     const { to, subject, body } = req.body ?? {};
     if (typeof to !== "string" || typeof subject !== "string") {
-      return res.status(400).json({ error: "invalid_request" });
+      return send(res, 400, { error: "invalid_request" });
     }
     const email: Email = { id: randomUUID(), to, subject, body: String(body ?? "") };
     state.emails.push(email);
-
-    if (maybeDropResponse(faults, "email", res)) return;
-    res.status(202).json({ messageId: email.id });
+    reply("email", res, 202, { messageId: email.id });
   });
 
   // ---------- Admin (for experiments and tests) ----------
