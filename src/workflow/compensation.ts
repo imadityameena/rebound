@@ -57,7 +57,7 @@ export async function compensateWorkflow<TInput>(
       timeoutMs: policy.timeoutMs,
     };
 
-    await repo.setCompensationStatus(id, workerId, index, "running", null, true);
+    await repo.setCompensationStatus(id, workerId, index, "running", { attempt });
     log(id, `${step.name}: undo attempt ${attempt}/${policy.maxAttempts} started`);
 
     try {
@@ -66,12 +66,12 @@ export async function compensateWorkflow<TInput>(
       const message = (err as Error).message;
       const decision = decideRetry(err, attempt, policy);
       if (decision.retry) {
-        await repo.setCompensationStatus(id, workerId, index, "retry_scheduled", message);
+        await repo.setCompensationStatus(id, workerId, index, "retry_scheduled", { error: message, delayMs: decision.delayMs });
         await repo.rescheduleWorkflow(id, workerId, decision.delayMs);
         log(id, `${step.name}: undo attempt ${attempt} failed (${message}); retrying in ${decision.delayMs}ms`);
         return;
       }
-      await repo.setCompensationStatus(id, workerId, index, "failed", message);
+      await repo.setCompensationStatus(id, workerId, index, "failed", { error: message });
       await repo.finishWorkflow(
         id,
         workerId,

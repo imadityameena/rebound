@@ -59,7 +59,7 @@ export async function executeWorkflow<TInput>(
     if (saved.status === "running") {
       log(id, `${step.name}: was in progress when the previous run stopped; outcome unknown, repeating it with the same idempotency key`);
     }
-    await repo.markStepRunning(id, workerId, index);
+    await repo.markStepRunning(id, workerId, index, attempt);
     log(id, `${step.name}: attempt ${attempt}/${policy.maxAttempts} started`);
 
     let output: Record<string, unknown>;
@@ -70,7 +70,7 @@ export async function executeWorkflow<TInput>(
       const decision = decideRetry(err, attempt, policy);
 
       if (decision.retry) {
-        await repo.markStepRetryScheduled(id, workerId, index, message);
+        await repo.markStepRetryScheduled(id, workerId, index, message, decision.delayMs);
         await repo.rescheduleWorkflow(id, workerId, decision.delayMs);
         log(id, `${step.name}: attempt ${attempt} failed (${message}); retrying in ${decision.delayMs}ms`);
         return;

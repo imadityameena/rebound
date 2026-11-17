@@ -39,7 +39,7 @@ export async function migrate(pool: Pool): Promise<string[]> {
 }
 
 // `npm run db:migrate`
-if (require.main === module) {
+if (typeof require !== "undefined" && require.main === module) {
   import("./pool").then(async ({ pool }) => {
     const applied = await migrate(pool);
     console.log(applied.length ? `Applied: ${applied.join(", ")}` : "Database is up to date");

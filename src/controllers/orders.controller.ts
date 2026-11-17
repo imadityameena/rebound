@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 import { parseOrderInput } from "../types/order";
-import { createWorkflow, describeWorkflow, IdempotencyConflictError } from "../workflow/engine";
+import { createWorkflow, describeWorkflow, IdempotencyConflictError, workflowHistory } from "../workflow/engine";
 import { orderWorkflow } from "../workflow/order-workflow";
 
 /**
@@ -40,4 +40,11 @@ export async function getOrder(req: Request, res: Response) {
   const order = await describeWorkflow(String(req.params.id));
   if (!order) return res.status(404).json({ error: "not_found" });
   res.json(order);
+}
+
+/** Every state change for the order, oldest first: attempts, retries, recoveries, undos. */
+export async function getOrderHistory(req: Request, res: Response) {
+  const history = await workflowHistory(String(req.params.id));
+  if (!history) return res.status(404).json({ error: "not_found" });
+  res.json(history);
 }

@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
+import type { PoolClient } from "pg";
 import { pool } from "./pool";
-import type { CompensationStatus, StepRow, WorkflowRow, WorkflowStatus } from "../types/workflow";
+import type { CompensationStatus, StepRow, WorkflowEventRow, WorkflowRow, WorkflowStatus } from "../types/workflow";
 
-/** All SQL for workflows and steps lives here, so the engine reads like the state machine it is. */
+/**
+ * All SQL for workflows, steps and their history lives here, so the engine
+ * reads like the state machine it is.
+ *
+ * Every state change also appends a row to workflow_events, in the SAME
+ * statement or transaction as the change. A crash can never leave a change
+ * without its history entry, or a history entry for a change that didn't happen.
+ */
 
 /**
  * Thrown when a worker tries to write to a workflow it no longer holds the
@@ -17,8 +25,38 @@ export class LeaseLostError extends Error {
   }
 }
 
-// Appended to step/workflow updates: "...only if this worker still holds the lease".
+export interface EventInput {
+  type: string;
+  stepIndex?: number | null;
+  detail?: Record<string, unknown> | null;
+}
+
+// Appended to step updates: "...only if this worker still holds the lease".
 const HOLDS_LEASE = `EXISTS (SELECT 1 FROM workflows w WHERE w.id = $1 AND w.locked_by = $2)`;
+
+async function insertEvent(client: PoolClient, workflowId: string, event: EventInput) {
+  await client.query(
+    `INSERT INTO workflow_events (workflow_id, type, step_index, detail) VALUES ($1, $2, $3, $4)`,
+    [workflowId, event.type, event.stepIndex ?? null, event.detail ? JSON.stringify(event.detail) : null],
+  );
+}
+
+async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ---------- Creating and reading ----------
 
 export interface CreateWorkflowParams {
   type: string;
@@ -34,10 +72,9 @@ export interface CreateWorkflowParams {
  */
 export async function createWorkflow(params: CreateWorkflowParams): Promise<{ workflow: WorkflowRow; created: boolean }> {
   const { type, input, stepNames, idempotencyKey = null, requestHash = null } = params;
-  const client = await pool.connect();
-  try {
-    // One transaction: never a workflow without its steps, or steps without a workflow.
-    await client.query("BEGIN");
+
+  // One transaction: never a workflow without its steps, or steps without a workflow.
+  const workflow = await inTransaction(async (client) => {
     const { rows } = await client.query<WorkflowRow>(
       `INSERT INTO workflows (id, type, status, input, idempotency_key, request_hash)
        VALUES ($1, $2, 'pending', $3, $4, $5)
@@ -45,33 +82,28 @@ export async function createWorkflow(params: CreateWorkflowParams): Promise<{ wo
        RETURNING *`,
       [randomUUID(), type, JSON.stringify(input), idempotencyKey, requestHash],
     );
+    if (rows.length === 0) return undefined;
 
-    if (rows.length === 0) {
-      // Same key seen before. If the first insert was still in flight, Postgres
-      // waited for it to commit, so this SELECT sees it.
-      await client.query("ROLLBACK");
-      const existing = await pool.query<WorkflowRow>(
-        `SELECT * FROM workflows WHERE type = $1 AND idempotency_key = $2`,
-        [type, idempotencyKey],
-      );
-      return { workflow: existing.rows[0], created: false };
-    }
-
-    const workflow = rows[0];
+    const created = rows[0];
     for (const [index, name] of stepNames.entries()) {
       await client.query(
         `INSERT INTO workflow_steps (workflow_id, step_index, name, status) VALUES ($1, $2, $3, 'pending')`,
-        [workflow.id, index, name],
+        [created.id, index, name],
       );
     }
-    await client.query("COMMIT");
-    return { workflow, created: true };
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+    await insertEvent(client, created.id, { type: "workflow_created", detail: { idempotencyKey } });
+    return created;
+  });
+
+  if (workflow) return { workflow, created: true };
+
+  // Same key seen before. If the first insert was still in flight, Postgres
+  // waited for it to commit, so this SELECT sees it.
+  const existing = await pool.query<WorkflowRow>(`SELECT * FROM workflows WHERE type = $1 AND idempotency_key = $2`, [
+    type,
+    idempotencyKey,
+  ]);
+  return { workflow: existing.rows[0], created: false };
 }
 
 export async function getWorkflow(id: string): Promise<WorkflowRow | undefined> {
@@ -87,6 +119,19 @@ export async function getSteps(workflowId: string): Promise<StepRow[]> {
   return rows;
 }
 
+/** The full history, oldest first, with step names filled in. */
+export async function getEvents(workflowId: string): Promise<WorkflowEventRow[]> {
+  const { rows } = await pool.query<WorkflowEventRow>(
+    `SELECT e.id, e.workflow_id, e.at, e.type, e.step_index, s.name AS step_name, e.detail
+       FROM workflow_events e
+       LEFT JOIN workflow_steps s ON s.workflow_id = e.workflow_id AND s.step_index = e.step_index
+      WHERE e.workflow_id = $1
+      ORDER BY e.id`,
+    [workflowId],
+  );
+  return rows;
+}
+
 // ---------- Leases ----------
 
 /**
@@ -97,22 +142,28 @@ export async function getSteps(workflowId: string): Promise<StepRow[]> {
  */
 export async function claimNextWorkflow(workerId: string, leaseMs: number): Promise<WorkflowRow | undefined> {
   const { rows } = await pool.query<WorkflowRow>(
-    `UPDATE workflows
-        -- A pending workflow starts running; a compensating one keeps compensating.
-        SET status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
-            locked_by = $1,
-            lease_expires_at = now() + make_interval(secs => $2 / 1000.0),
-            updated_at = now()
-      WHERE id = (
-        SELECT id FROM workflows
-         WHERE status IN ('pending', 'running', 'compensating')
-           AND next_run_at <= now()
-           AND (lease_expires_at IS NULL OR lease_expires_at < now())
-         ORDER BY next_run_at, created_at
-         FOR UPDATE SKIP LOCKED
-         LIMIT 1
-      )
-      RETURNING *`,
+    `WITH claimed AS (
+       UPDATE workflows
+          -- A pending workflow starts running; a compensating one keeps compensating.
+          SET status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
+              locked_by = $1,
+              lease_expires_at = now() + make_interval(secs => $2 / 1000.0),
+              updated_at = now()
+        WHERE id = (
+          SELECT id FROM workflows
+           WHERE status IN ('pending', 'running', 'compensating')
+             AND next_run_at <= now()
+             AND (lease_expires_at IS NULL OR lease_expires_at < now())
+           ORDER BY next_run_at, created_at
+           FOR UPDATE SKIP LOCKED
+           LIMIT 1
+        )
+        RETURNING *
+     ), event AS (
+       INSERT INTO workflow_events (workflow_id, type, detail)
+       SELECT id, 'claimed', jsonb_build_object('worker', $1::text) FROM claimed
+     )
+     SELECT * FROM claimed`,
     [workerId, leaseMs],
   );
   return rows[0];
@@ -136,9 +187,15 @@ export async function renewLease(workflowId: string, workerId: string, leaseMs: 
  */
 export async function releaseLeasesHeldBy(workerId: string): Promise<WorkflowRow[]> {
   const { rows } = await pool.query<WorkflowRow>(
-    `UPDATE workflows SET locked_by = NULL, lease_expires_at = NULL, updated_at = now()
-      WHERE locked_by = $1 AND status IN ('pending', 'running', 'compensating')
-      RETURNING *`,
+    `WITH released AS (
+       UPDATE workflows SET locked_by = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE locked_by = $1 AND status IN ('pending', 'running', 'compensating')
+        RETURNING *
+     ), event AS (
+       INSERT INTO workflow_events (workflow_id, type, detail)
+       SELECT id, 'recovered_after_restart', jsonb_build_object('worker', $1::text) FROM released
+     )
+     SELECT * FROM released`,
     [workerId],
   );
   return rows;
@@ -159,9 +216,20 @@ export async function listUnfinished(): Promise<(WorkflowRow & { current_step: s
 
 // ---------- Writes made while holding the lease ----------
 
-async function fencedUpdate(sql: string, params: unknown[], workflowId: string, workerId: string) {
-  const { rowCount } = await pool.query(sql, params);
-  if (rowCount === 0) throw new LeaseLostError(workflowId, workerId);
+/**
+ * Runs an UPDATE (whose first two params are workflowId and workerId) and,
+ * in the same statement, appends its event. 0 rows updated means we no longer
+ * hold the lease.
+ */
+async function fencedUpdate(updateSql: string, params: unknown[], event: EventInput) {
+  const n = params.length;
+  const { rowCount } = await pool.query(
+    `WITH updated AS (${updateSql} RETURNING 1)
+     INSERT INTO workflow_events (workflow_id, type, step_index, detail)
+     SELECT $1, $${n + 1}, $${n + 2}::int, $${n + 3}::jsonb FROM updated`,
+    [...params, event.type, event.stepIndex ?? null, event.detail ? JSON.stringify(event.detail) : null],
+  );
+  if (rowCount === 0) throw new LeaseLostError(String(params[0]), String(params[1]));
 }
 
 /** Sets a final status and gives up the lease. */
@@ -176,20 +244,18 @@ export async function finishWorkflow(
         SET status = $3, error = $4, locked_by = NULL, lease_expires_at = NULL, updated_at = now()
       WHERE id = $1 AND locked_by = $2`,
     [workflowId, workerId, status, error],
-    workflowId,
-    workerId,
+    { type: `workflow_${status}`, detail: error ? { error } : null },
   );
 }
 
 /** Written BEFORE the external call. */
-export async function markStepRunning(workflowId: string, workerId: string, stepIndex: number) {
+export async function markStepRunning(workflowId: string, workerId: string, stepIndex: number, attempt: number) {
   await fencedUpdate(
     `UPDATE workflow_steps
         SET status = 'running', attempts = attempts + 1, started_at = now(), error = NULL
       WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
     [workflowId, workerId, stepIndex],
-    workflowId,
-    workerId,
+    { type: "step_started", stepIndex, detail: { attempt } },
   );
 }
 
@@ -200,20 +266,24 @@ export async function markStepSucceeded(workflowId: string, workerId: string, st
         SET status = 'succeeded', output = $4, completed_at = now()
       WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
     [workflowId, workerId, stepIndex, JSON.stringify(output)],
-    workflowId,
-    workerId,
+    { type: "step_succeeded", stepIndex, detail: { output } },
   );
 }
 
 /** A transient failure: record it and leave the step waiting for its next attempt. */
-export async function markStepRetryScheduled(workflowId: string, workerId: string, stepIndex: number, error: string) {
+export async function markStepRetryScheduled(
+  workflowId: string,
+  workerId: string,
+  stepIndex: number,
+  error: string,
+  delayMs: number,
+) {
   await fencedUpdate(
     `UPDATE workflow_steps
         SET status = 'retry_scheduled', error = $4
       WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
     [workflowId, workerId, stepIndex, error],
-    workflowId,
-    workerId,
+    { type: "step_retry_scheduled", stepIndex, detail: { error, delayMs } },
   );
 }
 
@@ -229,8 +299,7 @@ export async function rescheduleWorkflow(workflowId: string, workerId: string, d
             locked_by = NULL, lease_expires_at = NULL, updated_at = now()
       WHERE id = $1 AND locked_by = $2`,
     [workflowId, workerId, delayMs],
-    workflowId,
-    workerId,
+    { type: "released_until_retry", detail: { delayMs } },
   );
 }
 
@@ -251,42 +320,49 @@ export async function failStepAndBeginCompensation(params: {
   compensateStepIndexes: number[];
 }) {
   const { workflowId, workerId, stepIndex, error, outcomeUnknown, reason, compensateStepIndexes } = params;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  await inTransaction(async (client) => {
     const wf = await client.query(
       `UPDATE workflows SET status = 'compensating', error = $3, updated_at = now()
         WHERE id = $1 AND locked_by = $2`,
       [workflowId, workerId, reason],
     );
     if (wf.rowCount === 0) throw new LeaseLostError(workflowId, workerId);
+
     await client.query(
       `UPDATE workflow_steps SET status = 'failed', error = $3, outcome_unknown = $4, completed_at = now()
         WHERE workflow_id = $1 AND step_index = $2`,
       [workflowId, stepIndex, error, outcomeUnknown],
     );
-    await client.query(
+    const queued = await client.query<{ step_index: number }>(
       `UPDATE workflow_steps SET compensation_status = 'pending'
-        WHERE workflow_id = $1 AND step_index = ANY($2::int[]) AND status = 'succeeded'`,
+        WHERE workflow_id = $1 AND step_index = ANY($2::int[]) AND status = 'succeeded'
+        RETURNING step_index`,
       [workflowId, compensateStepIndexes],
     );
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+
+    await insertEvent(client, workflowId, { type: "step_failed", stepIndex, detail: { error, outcomeUnknown } });
+    await insertEvent(client, workflowId, {
+      type: "compensation_started",
+      detail: { reason, undo: queued.rows.map((r) => r.step_index).sort((a, b) => b - a) },
+    });
+  });
 }
 
-/** Updates a step's undo progress. `countAttempt` is set when an undo attempt starts. */
+const UNDO_EVENT: Record<CompensationStatus, string> = {
+  pending: "undo_queued",
+  running: "undo_started",
+  retry_scheduled: "undo_retry_scheduled",
+  succeeded: "undo_succeeded",
+  failed: "undo_failed",
+};
+
+/** Updates a step's undo progress. `attempt` is passed when an undo attempt starts. */
 export async function setCompensationStatus(
   workflowId: string,
   workerId: string,
   stepIndex: number,
   status: CompensationStatus,
-  error: string | null = null,
-  countAttempt = false,
+  opts: { error?: string; attempt?: number; delayMs?: number } = {},
 ) {
   await fencedUpdate(
     `UPDATE workflow_steps
@@ -294,8 +370,7 @@ export async function setCompensationStatus(
             compensation_error = $5,
             compensation_attempts = compensation_attempts + $6
       WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
-    [workflowId, workerId, stepIndex, status, error, countAttempt ? 1 : 0],
-    workflowId,
-    workerId,
+    [workflowId, workerId, stepIndex, status, opts.error ?? null, status === "running" ? 1 : 0],
+    { type: UNDO_EVENT[status], stepIndex, detail: Object.keys(opts).length ? opts : null },
   );
 }

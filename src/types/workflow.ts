@@ -35,6 +35,16 @@ export interface StepRow {
   outcome_unknown: boolean;
 }
 
+export interface WorkflowEventRow {
+  id: string;
+  workflow_id: string;
+  at: Date;
+  type: string;
+  step_index: number | null;
+  step_name: string | null;
+  detail: Record<string, unknown> | null;
+}
+
 /** What a step can see: the workflow input and the outputs of earlier steps. */
 export interface StepContext<TInput> {
   workflowId: string;

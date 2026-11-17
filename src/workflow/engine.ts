@@ -45,6 +45,23 @@ export async function createWorkflow<TInput>(
   return result;
 }
 
+/** Every recorded state change for one workflow, oldest first. */
+export async function workflowHistory(workflowId: string) {
+  const workflow = await repo.getWorkflow(workflowId);
+  if (!workflow) return undefined;
+  const events = await repo.getEvents(workflowId);
+  return {
+    id: workflow.id,
+    status: workflow.status,
+    events: events.map((e) => ({
+      at: e.at,
+      type: e.type,
+      step: e.step_name,
+      ...(e.detail ? { detail: e.detail } : {}),
+    })),
+  };
+}
+
 /** Workflow + steps, shaped for API responses. */
 export async function describeWorkflow(workflowId: string) {
   const workflow = await repo.getWorkflow(workflowId);

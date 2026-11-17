@@ -116,4 +116,21 @@ export const migrations: Migration[] = [
         WHERE status IN ('pending', 'running', 'compensating');
     `,
   },
+  {
+    id: "006_workflow_events",
+    sql: `
+      -- Append-only history: one row per state change, never updated or deleted.
+      -- The current-state tables say WHERE a workflow is; this says HOW it got there:
+      -- every attempt, retry delay, crash recovery and undo.
+      CREATE TABLE workflow_events (
+        id          bigserial PRIMARY KEY,
+        workflow_id uuid NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+        at          timestamptz NOT NULL DEFAULT clock_timestamp(),
+        type        text NOT NULL,
+        step_index  int,
+        detail      jsonb
+      );
+      CREATE INDEX workflow_events_workflow_idx ON workflow_events (workflow_id, id);
+    `,
+  },
 ];
