@@ -66,6 +66,10 @@ export async function describeWorkflow(workflowId: string) {
       error: s.error,
       startedAt: s.started_at,
       completedAt: s.completed_at,
+      outcomeUnknown: s.outcome_unknown,
+      compensation: s.compensation_status
+        ? { status: s.compensation_status, attempts: s.compensation_attempts, error: s.compensation_error }
+        : null,
     })),
   };
 }

@@ -30,6 +30,11 @@ interface Charge {
   customerEmail: string;
   status: "captured" | "refunded";
 }
+interface Refund {
+  id: string;
+  chargeId: string;
+  amountCents: number;
+}
 interface Email {
   id: string;
   to: string;
@@ -47,6 +52,7 @@ export class FakeProviderState {
   stock = new Map<string, number>();
   reservations = new Map<string, Reservation>();
   charges = new Map<string, Charge>();
+  refunds: Refund[] = [];
   emails: Email[] = [];
   idempotency = new IdempotencyStore();
 
@@ -58,6 +64,7 @@ export class FakeProviderState {
     this.stock = new Map(Object.entries(DEFAULT_STOCK));
     this.reservations.clear();
     this.charges.clear();
+    this.refunds = [];
     this.emails = [];
     this.idempotency.clear();
   }
@@ -72,12 +79,14 @@ export class FakeProviderState {
         activeReservations: reservations.filter((r) => r.status === "reserved").length,
         charges: charges.length,
         capturedCents: charges.filter((c) => c.status === "captured").reduce((s, c) => s + c.amountCents, 0),
-        refunds: charges.filter((c) => c.status === "refunded").length,
+        refunds: this.refunds.length,
+        refundedCents: this.refunds.reduce((s, r) => s + r.amountCents, 0),
         emails: this.emails.length,
         idempotencyKeys: this.idempotency.size(),
       },
       reservations,
       charges,
+      refunds: this.refunds,
       emails: this.emails,
     };
   }
@@ -122,11 +131,12 @@ export function createFakeProviderApp(faults = new FaultRegistry(), state = new 
     const reservation = state.reservations.get(String(req.params.id));
     if (!reservation) return send(res, 404, { error: "unknown_reservation" });
 
-    // Releasing twice must not put the stock back twice.
-    if (reservation.status === "reserved") {
-      reservation.status = "released";
-      state.stock.set(reservation.sku, (state.stock.get(reservation.sku) ?? 0) + reservation.quantity);
-    }
+    // Like a real system, a second release is an error, not a silent no-op.
+    // Only a repeat with the same Idempotency-Key gets the original success back.
+    if (reservation.status === "released") return send(res, 409, { error: "already_released" });
+
+    reservation.status = "released";
+    state.stock.set(reservation.sku, (state.stock.get(reservation.sku) ?? 0) + reservation.quantity);
     reply("inventory", res, 200, { reservationId: reservation.id, status: reservation.status });
   });
 
@@ -145,9 +155,15 @@ export function createFakeProviderApp(faults = new FaultRegistry(), state = new 
     const charge = state.charges.get(String(req.params.id));
     if (!charge) return send(res, 404, { error: "unknown_charge" });
 
-    // Refunding twice must not pay the customer back twice.
+    // Like Stripe: each refund is a separate record, and refunding an
+    // already-refunded charge is an error. Only a repeat with the same
+    // Idempotency-Key gets the original refund back.
+    if (charge.status === "refunded") return send(res, 409, { error: "charge_already_refunded" });
+
     charge.status = "refunded";
-    reply("payment", res, 200, { chargeId: charge.id, status: charge.status });
+    const refund: Refund = { id: randomUUID(), chargeId: charge.id, amountCents: charge.amountCents };
+    state.refunds.push(refund);
+    reply("payment", res, 200, { refundId: refund.id, chargeId: charge.id });
   });
 
   // ---------- Email ----------

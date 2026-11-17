@@ -89,4 +89,31 @@ export const migrations: Migration[] = [
         CHECK (status IN ('pending', 'running', 'retry_scheduled', 'succeeded', 'failed'));
     `,
   },
+  {
+    id: "005_compensation",
+    sql: `
+      -- compensating: a step failed for good; earlier steps are being undone.
+      -- compensated:  everything that happened was undone; the order is cancelled cleanly.
+      -- failed:       something could not be undone or its outcome is unknown.
+      --               A person needs to look at it.
+      ALTER TABLE workflows DROP CONSTRAINT workflows_status_check;
+      ALTER TABLE workflows ADD CONSTRAINT workflows_status_check
+        CHECK (status IN ('pending', 'running', 'completed', 'compensating', 'compensated', 'failed'));
+
+      -- Undo progress is tracked per step, separately from the step's own status,
+      -- so a crash in the middle of compensation resumes exactly where it stopped.
+      ALTER TABLE workflow_steps
+        ADD COLUMN compensation_status text
+          CHECK (compensation_status IN ('pending', 'running', 'retry_scheduled', 'succeeded', 'failed')),
+        ADD COLUMN compensation_attempts int NOT NULL DEFAULT 0,
+        ADD COLUMN compensation_error text,
+        -- True when the step's final error left its outcome unknown (timeout,
+        -- dropped connection): the side effect may have happened anyway.
+        ADD COLUMN outcome_unknown boolean NOT NULL DEFAULT false;
+
+      DROP INDEX workflows_runnable_idx;
+      CREATE INDEX workflows_runnable_idx ON workflows (next_run_at)
+        WHERE status IN ('pending', 'running', 'compensating');
+    `,
+  },
 ];

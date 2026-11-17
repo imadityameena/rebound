@@ -1,6 +1,7 @@
 import type { RetryPolicy } from "../workflow/retry";
 
-export type WorkflowStatus = "pending" | "running" | "completed" | "failed";
+export type WorkflowStatus = "pending" | "running" | "completed" | "compensating" | "compensated" | "failed";
+export type CompensationStatus = "pending" | "running" | "retry_scheduled" | "succeeded" | "failed";
 export type StepStatus = "pending" | "running" | "retry_scheduled" | "succeeded" | "failed";
 
 export interface WorkflowRow {
@@ -28,6 +29,10 @@ export interface StepRow {
   error: string | null;
   started_at: Date | null;
   completed_at: Date | null;
+  compensation_status: CompensationStatus | null;
+  compensation_attempts: number;
+  compensation_error: string | null;
+  outcome_unknown: boolean;
 }
 
 /** What a step can see: the workflow input and the outputs of earlier steps. */
@@ -50,6 +55,12 @@ export interface StepDefinition<TInput> {
   /** Overrides the default retry policy for this step. */
   retry?: Partial<RetryPolicy>;
   execute: (ctx: StepContext<TInput>) => Promise<Record<string, unknown>>;
+  /**
+   * Undoes this step after a later step fails for good. Receives what
+   * `execute` returned (e.g. the chargeId to refund). Must be safe to run more
+   * than once. Steps without it (e.g. sending an email) are not undone.
+   */
+  compensate?: (ctx: StepContext<TInput> & { output: Record<string, unknown> }) => Promise<void>;
 }
 
 export interface WorkflowDefinition<TInput> {

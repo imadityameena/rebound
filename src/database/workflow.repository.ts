@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { pool } from "./pool";
-import type { StepRow, WorkflowRow, WorkflowStatus } from "../types/workflow";
+import type { CompensationStatus, StepRow, WorkflowRow, WorkflowStatus } from "../types/workflow";
 
 /** All SQL for workflows and steps lives here, so the engine reads like the state machine it is. */
 
@@ -98,13 +98,14 @@ export async function getSteps(workflowId: string): Promise<StepRow[]> {
 export async function claimNextWorkflow(workerId: string, leaseMs: number): Promise<WorkflowRow | undefined> {
   const { rows } = await pool.query<WorkflowRow>(
     `UPDATE workflows
-        SET status = 'running',
+        -- A pending workflow starts running; a compensating one keeps compensating.
+        SET status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
             locked_by = $1,
             lease_expires_at = now() + make_interval(secs => $2 / 1000.0),
             updated_at = now()
       WHERE id = (
         SELECT id FROM workflows
-         WHERE status IN ('pending', 'running')
+         WHERE status IN ('pending', 'running', 'compensating')
            AND next_run_at <= now()
            AND (lease_expires_at IS NULL OR lease_expires_at < now())
          ORDER BY next_run_at, created_at
@@ -136,7 +137,7 @@ export async function renewLease(workflowId: string, workerId: string, leaseMs: 
 export async function releaseLeasesHeldBy(workerId: string): Promise<WorkflowRow[]> {
   const { rows } = await pool.query<WorkflowRow>(
     `UPDATE workflows SET locked_by = NULL, lease_expires_at = NULL, updated_at = now()
-      WHERE locked_by = $1 AND status IN ('pending', 'running')
+      WHERE locked_by = $1 AND status IN ('pending', 'running', 'compensating')
       RETURNING *`,
     [workerId],
   );
@@ -150,7 +151,7 @@ export async function listUnfinished(): Promise<(WorkflowRow & { current_step: s
               WHERE s.workflow_id = w.id AND s.status <> 'succeeded'
               ORDER BY s.step_index LIMIT 1) AS current_step
        FROM workflows w
-      WHERE w.status IN ('pending', 'running')
+      WHERE w.status IN ('pending', 'running', 'compensating')
       ORDER BY w.created_at`,
   );
   return rows;
@@ -167,7 +168,7 @@ async function fencedUpdate(sql: string, params: unknown[], workflowId: string, 
 export async function finishWorkflow(
   workflowId: string,
   workerId: string,
-  status: Extract<WorkflowStatus, "completed" | "failed">,
+  status: Extract<WorkflowStatus, "completed" | "compensated" | "failed">,
   error: string | null = null,
 ) {
   await fencedUpdate(
@@ -233,12 +234,67 @@ export async function rescheduleWorkflow(workflowId: string, workerId: string, d
   );
 }
 
-export async function markStepFailed(workflowId: string, workerId: string, stepIndex: number, error: string) {
+/**
+ * A step failed for good. In ONE transaction: mark the step failed, switch the
+ * workflow to 'compensating', and queue the undo of each earlier succeeded step.
+ * If these were separate writes, a crash between them could leave a
+ * compensating workflow with nothing queued to undo, and stock or money
+ * would stay taken.
+ */
+export async function failStepAndBeginCompensation(params: {
+  workflowId: string;
+  workerId: string;
+  stepIndex: number;
+  error: string;
+  outcomeUnknown: boolean;
+  reason: string;
+  compensateStepIndexes: number[];
+}) {
+  const { workflowId, workerId, stepIndex, error, outcomeUnknown, reason, compensateStepIndexes } = params;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const wf = await client.query(
+      `UPDATE workflows SET status = 'compensating', error = $3, updated_at = now()
+        WHERE id = $1 AND locked_by = $2`,
+      [workflowId, workerId, reason],
+    );
+    if (wf.rowCount === 0) throw new LeaseLostError(workflowId, workerId);
+    await client.query(
+      `UPDATE workflow_steps SET status = 'failed', error = $3, outcome_unknown = $4, completed_at = now()
+        WHERE workflow_id = $1 AND step_index = $2`,
+      [workflowId, stepIndex, error, outcomeUnknown],
+    );
+    await client.query(
+      `UPDATE workflow_steps SET compensation_status = 'pending'
+        WHERE workflow_id = $1 AND step_index = ANY($2::int[]) AND status = 'succeeded'`,
+      [workflowId, compensateStepIndexes],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Updates a step's undo progress. `countAttempt` is set when an undo attempt starts. */
+export async function setCompensationStatus(
+  workflowId: string,
+  workerId: string,
+  stepIndex: number,
+  status: CompensationStatus,
+  error: string | null = null,
+  countAttempt = false,
+) {
   await fencedUpdate(
     `UPDATE workflow_steps
-        SET status = 'failed', error = $4, completed_at = now()
+        SET compensation_status = $4,
+            compensation_error = $5,
+            compensation_attempts = compensation_attempts + $6
       WHERE workflow_id = $1 AND step_index = $3 AND ${HOLDS_LEASE}`,
-    [workflowId, workerId, stepIndex, error],
+    [workflowId, workerId, stepIndex, status, error, countAttempt ? 1 : 0],
     workflowId,
     workerId,
   );

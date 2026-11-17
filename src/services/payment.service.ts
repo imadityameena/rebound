@@ -8,6 +8,6 @@ export async function chargePayment(
   return postJson("/payments/charges", { amountCents, customerEmail }, opts);
 }
 
-export async function refundPayment(chargeId: string, opts: CallOptions): Promise<void> {
-  await postJson(`/payments/charges/${chargeId}/refund`, {}, opts);
+export async function refundPayment(chargeId: string, opts: CallOptions): Promise<{ refundId: string }> {
+  return postJson(`/payments/charges/${chargeId}/refund`, {}, opts);
 }

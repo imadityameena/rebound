@@ -12,6 +12,8 @@ export class ServiceError extends Error {
     message: string,
     readonly kind: FailureKind,
     readonly status?: number,
+    /** No reply arrived (timeout, dropped connection), so the operation may or may not have happened. */
+    readonly outcomeUnknown = false,
   ) {
     super(message);
     this.name = "ServiceError";
@@ -44,10 +46,10 @@ export async function postJson<T>(path: string, body: unknown, opts: CallOptions
       // done the work and just been slow to reply. Treat the outcome as
       // unknown: retry with the same idempotency key and let the provider
       // tell us what happened.
-      throw new ServiceError(`${path}: no response within ${opts.timeoutMs}ms (outcome unknown)`, "transient");
+      throw new ServiceError(`${path}: no response within ${opts.timeoutMs}ms (outcome unknown)`, "transient", undefined, true);
     }
     // The request never got a reply: refused, reset, or dropped mid-way.
-    throw new ServiceError(`${path}: network error (${(err as Error).message})`, "transient");
+    throw new ServiceError(`${path}: network error (${(err as Error).message})`, "transient", undefined, true);
   }
 
   let data: { error?: string } = {};

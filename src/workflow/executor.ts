@@ -1,9 +1,12 @@
 import type { StepContext, WorkflowDefinition, WorkflowRow } from "../types/workflow";
 import * as repo from "../database/workflow.repository";
 import { config } from "../config/env";
+import { ServiceError } from "../services/provider-client";
 import { decideRetry, type RetryPolicy } from "./retry";
+import { compensateWorkflow } from "./compensation";
+import { log } from "./log";
 
-export const log = (workflowId: string, msg: string) => console.log(`[wf ${workflowId.slice(0, 8)}] ${msg}`);
+export { log };
 
 /**
  * Runs a workflow's remaining steps. The caller (the worker) must already hold
@@ -12,7 +15,7 @@ export const log = (workflowId: string, msg: string) => console.log(`[wf ${workf
  *   pending ──▶ running ──▶ succeeded
  *                  │
  *                  ├── transient error, attempts left ──▶ retry_scheduled ──(after backoff)──▶ running
- *                  └── permanent error / out of attempts ──▶ failed
+ *                  └── permanent error / out of attempts ──▶ failed ──▶ compensate earlier steps
  *
  * Steps that already succeeded are skipped, and their saved outputs are loaded
  * back into the context. A step left 'running' by a crash is executed again:
@@ -28,6 +31,10 @@ export async function executeWorkflow<TInput>(
   workerId: string,
 ) {
   const id = workflow.id;
+  if (workflow.status === "compensating") {
+    return compensateWorkflow(definition, workflow, workerId);
+  }
+
   const ctx: StepContext<TInput> = {
     workflowId: id,
     input: workflow.input as TInput,
@@ -70,10 +77,18 @@ export async function executeWorkflow<TInput>(
       }
 
       const why = decision.reason === "exhausted" ? `gave up after ${attempt} attempts` : "permanent failure";
-      await repo.markStepFailed(id, workerId, index, message);
-      await repo.finishWorkflow(id, workerId, "failed", `${step.name}: ${why}: ${message}`);
-      log(id, `${step.name}: ${why}: ${message}`);
-      return;
+      const reason = `${step.name}: ${why}: ${message}`;
+      log(id, `${reason}; undoing earlier steps`);
+      await repo.failStepAndBeginCompensation({
+        workflowId: id,
+        workerId,
+        stepIndex: index,
+        error: message,
+        outcomeUnknown: err instanceof ServiceError && err.outcomeUnknown,
+        reason,
+        compensateStepIndexes: definition.steps.slice(0, index).map((_, i) => i),
+      });
+      return compensateWorkflow(definition, { ...workflow, status: "compensating", error: reason }, workerId);
     }
 
     await repo.markStepSucceeded(id, workerId, index, output);
