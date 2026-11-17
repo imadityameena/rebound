@@ -15,7 +15,8 @@
     "db:migrate": "tsx src/database/migrate.ts",
     "db:psql": "docker compose exec postgres sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"'",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench": "tsx scripts/bench.ts"
   },
   "repository": {
     "type": "git",
